@@ -1,6 +1,7 @@
 "use client"
 
 import React from 'react'
+import { removeBackground } from '@imgly/background-removal'
 
 const BACKGROUND_FILL = '#ed8d26'
 
@@ -57,8 +58,6 @@ export default function ImageGenerator() {
       if (shouldRemoveBg) {
         setProcessingState({ phase: 'removing-background' })
         setProgress(0.25)
-        const bgModule = await import('@imgly/background-removal')
-        const removeBackground = (bgModule as any).removeBackground as (input: Blob | File, options?: Record<string, unknown>) => Promise<Blob>
         inputForPixelate = await removeBackground(file)
       }
 

@@ -1,9 +1,4 @@
-import dynamic from 'next/dynamic'
-
-const ImageGenerator = dynamic(() => import('./components/ImageGenerator'), {
-  ssr: false,
-  loading: () => <p className="text-sm text-neutral-600 dark:text-neutral-300">Loading image tools…</p>,
-})
+import ImageGenerator from './components/ImageGenerator'
 
 export default function Page() {
   return (
