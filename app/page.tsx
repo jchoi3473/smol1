@@ -1,16 +1,24 @@
+import dynamic from 'next/dynamic'
+
+const ImageGenerator = dynamic(() => import('./components/ImageGenerator'), {
+  ssr: false,
+  loading: () => <p className="text-sm text-neutral-600 dark:text-neutral-300">Loading image tools…</p>,
+})
+
 export default function Page() {
   return (
     <section>
       <h1 className="mb-8 text-2xl font-semibold tracking-tighter">
-        My Portfolio
+        Smol1 on Bonk
       </h1>
       <p className="mb-4">
-        {`I'm a Vim enthusiast and tab advocate, finding unmatched efficiency in
-        Vim's keystroke commands and tabs' flexibility for personal viewing
-        preferences. This extends to my support for static typing, where its
-        early error detection ensures cleaner code, and my preference for dark
-        mode, which eases long coding sessions by reducing eye strain.`}
+        {`Smol 1 website under development. In the meantime, have fun with the image generator!`}
       </p>
+
+      {/* Placeholder for image generator */}
+      <div className="mt-12">
+        <ImageGenerator />
+      </div>
     </section>
   )
 }
