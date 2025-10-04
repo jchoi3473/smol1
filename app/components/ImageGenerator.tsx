@@ -15,9 +15,15 @@ type ProcessingState =
 export default function ImageGenerator() {
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null)
   const [processingState, setProcessingState] = React.useState<ProcessingState>({ phase: 'idle' })
-  const [pixelSize, setPixelSize] = React.useState<number>(15)
+  const [pixelSize, setPixelSize] = React.useState<number>(8)
   const [progress, setProgress] = React.useState<number>(0)
   const [removeBg, setRemoveBg] = React.useState<boolean>(true)
+  const [palette, setPalette] = React.useState<PaletteName>('pico8')
+  const [ditherEnabled, setDitherEnabled] = React.useState<boolean>(true)
+  const [ditherStrength, setDitherStrength] = React.useState<number>(0.2)
+  const [outlineThickness, setOutlineThickness] = React.useState<number>(0.5)
+  const [normalizeEnabled, setNormalizeEnabled] = React.useState<boolean>(true)
+  const [normalizeLongestSide, setNormalizeLongestSide] = React.useState<number>(512)
 
   const [originalPreviewUrl, setOriginalPreviewUrl] = React.useState<string | null>(null)
   const [finalPreviewUrl, setFinalPreviewUrl] = React.useState<string | null>(null)
@@ -54,16 +60,24 @@ export default function ImageGenerator() {
 
   const processImage = async (file: File, pixelBlockSize: number, shouldRemoveBg: boolean) => {
     try {
-      let inputForPixelate: Blob = file
+      let workingBlob: Blob = file
+
+      // Optional: pre-normalize very large images for stability and speed
+      if (normalizeEnabled) {
+        setProgress(0.15)
+        workingBlob = await normalizeImageBlob(file, normalizeLongestSide)
+      }
       if (shouldRemoveBg) {
         setProcessingState({ phase: 'removing-background' })
         setProgress(0.25)
-        inputForPixelate = await removeBackground(file)
+        // Ensure File type for library compatibility
+        const workingFile = new File([workingBlob], 'input.png', { type: 'image/png' })
+        workingBlob = await removeBackground(workingFile)
       }
 
       setProcessingState({ phase: 'pixelating' })
       setProgress(shouldRemoveBg ? 0.6 : 0.4)
-      const pixelatedBlob = await pixelateImage(inputForPixelate, pixelBlockSize)
+      const pixelatedBlob = await pixelateImage(workingBlob, pixelBlockSize)
 
       const outUrl = URL.createObjectURL(pixelatedBlob)
       setFinalPreviewUrl(outUrl)
@@ -77,11 +91,12 @@ export default function ImageGenerator() {
   }
 
   const pixelateImage = async (blob: Blob, blockSize: number): Promise<Blob> => {
+    // Load input
     const img = await blobToImage(blob)
     const width = img.naturalWidth || img.width
     const height = img.naturalHeight || img.height
 
-    // Draw original to an offscreen canvas
+    // Stage 1: draw original to source canvas and read alpha for subject mask
     const sourceCanvas = document.createElement('canvas')
     sourceCanvas.width = width
     sourceCanvas.height = height
@@ -89,36 +104,69 @@ export default function ImageGenerator() {
     if (!sctx) throw new Error('Failed to get 2D context')
     sctx.drawImage(img, 0, 0, width, height)
 
-    // Scale down to create pixelated effect
-    const smallW = Math.max(1, Math.floor(width / Math.max(1, blockSize)))
-    const smallH = Math.max(1, Math.floor(height / Math.max(1, blockSize)))
+    // If we have transparency (from background removal), crop to subject bounds to feel like a sprite
+    const srcImage = sctx.getImageData(0, 0, width, height)
+    const cropBounds = getOpaqueBounds(srcImage, 16) || { x: 0, y: 0, w: width, h: height }
+
+    const cropCanvas = document.createElement('canvas')
+    cropCanvas.width = Math.max(1, cropBounds.w)
+    cropCanvas.height = Math.max(1, cropBounds.h)
+    const cropCtx = cropCanvas.getContext('2d')
+    if (!cropCtx) throw new Error('Failed to get crop 2D context')
+    cropCtx.imageSmoothingEnabled = false
+    cropCtx.drawImage(sourceCanvas, cropBounds.x, cropBounds.y, cropBounds.w, cropBounds.h, 0, 0, cropBounds.w, cropBounds.h)
+
+    // Stage 2: scale down to small sprite resolution derived from blockSize
+    const smallW = Math.max(8, Math.floor(cropBounds.w / Math.max(1, blockSize)))
+    const smallH = Math.max(8, Math.floor(cropBounds.h / Math.max(1, blockSize)))
     const smallCanvas = document.createElement('canvas')
     smallCanvas.width = smallW
     smallCanvas.height = smallH
     const smallCtx = smallCanvas.getContext('2d')
     if (!smallCtx) throw new Error('Failed to get small 2D context')
     smallCtx.imageSmoothingEnabled = false
-    smallCtx.drawImage(sourceCanvas, 0, 0, smallW, smallH)
+    smallCtx.drawImage(cropCanvas, 0, 0, cropBounds.w, cropBounds.h, 0, 0, smallW, smallH)
 
-    // Draw back up onto a square canvas without smoothing
-    const square = Math.max(width, height)
+    // Stage 3: apply palette quantization with optional ordered dithering on the small sprite
+    const smallImage = smallCtx.getImageData(0, 0, smallW, smallH)
+    const paletteRgb = PALETTES[palette]
+    const ditherAmt = ditherEnabled ? ditherStrength : 0
+    const quantized = quantizeImageToPalette(smallImage, paletteRgb, ditherAmt)
+    smallCtx.putImageData(quantized, 0, 0)
+
+    // Stage 4: create 1-3 px outline from alpha at small resolution
+    const outlineCanvas = document.createElement('canvas')
+    outlineCanvas.width = smallW
+    outlineCanvas.height = smallH
+    const outlineCtx = outlineCanvas.getContext('2d')
+    if (!outlineCtx) throw new Error('Failed to get outline 2D context')
+    const outlineImage = createPixelOutline(quantized, Math.max(0, Math.floor(outlineThickness)))
+    outlineCtx.putImageData(outlineImage, 0, 0)
+
+    // Stage 5: draw to final square canvas with nearest-neighbor upscaling
+    const square = Math.max(cropBounds.w, cropBounds.h)
     const finalCanvas = document.createElement('canvas')
     finalCanvas.width = square
     finalCanvas.height = square
     const fctx = finalCanvas.getContext('2d')
     if (!fctx) throw new Error('Failed to get final 2D context')
     fctx.imageSmoothingEnabled = false
-    // Fill background first to replace transparency with the requested color
+
+    // background
     fctx.fillStyle = BACKGROUND_FILL
     fctx.fillRect(0, 0, square, square)
 
-    // Composite pixelated subject scaled to 70% and centered
-    const scale = 0.7
-    const targetW = Math.max(1, Math.floor(width * scale))
-    const targetH = Math.max(1, Math.floor(height * scale))
+    // Composite outline then sprite, scaled to ~60% coverage of longest side and centered
+    const coverage = 0.6
+    const smallLongest = Math.max(smallW, smallH)
+    const scaledLongest = Math.max(1, Math.floor(square * coverage))
+    const k = scaledLongest / smallLongest
+    const targetW = Math.max(1, Math.floor(smallW * k))
+    const targetH = Math.max(1, Math.floor(smallH * k))
     const offsetX = Math.floor((square - targetW) / 2)
     const offsetY = Math.floor((square - targetH) / 2)
 
+    fctx.drawImage(outlineCanvas, 0, 0, smallW, smallH, offsetX, offsetY, targetW, targetH)
     fctx.drawImage(smallCanvas, 0, 0, smallW, smallH, offsetX, offsetY, targetW, targetH)
 
     const outBlob = await canvasToBlob(finalCanvas, 'image/png')
@@ -153,14 +201,211 @@ export default function ImageGenerator() {
     })
   }
 
-  const onPixelSizeChange: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
-    const next = Number(e.target.value)
-    setPixelSize(next)
-    if (selectedFile) {
-      // Reprocess with the new pixel size
-      setProgress(0)
-      await processImage(selectedFile, next, removeBg)
+  // ==== Pixel-art helpers ====
+
+  async function normalizeImageBlob(input: Blob, longestSide: number): Promise<Blob> {
+    const img = await blobToImage(input)
+    const width = img.naturalWidth || img.width
+    const height = img.naturalHeight || img.height
+    const currentLongest = Math.max(width, height)
+    if (currentLongest <= longestSide) {
+      return input
     }
+    const scale = longestSide / currentLongest
+    const targetW = Math.max(1, Math.round(width * scale))
+    const targetH = Math.max(1, Math.round(height * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = targetW
+    canvas.height = targetH
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('Failed to get 2D context for normalize')
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+    ctx.drawImage(img, 0, 0, width, height, 0, 0, targetW, targetH)
+    return await canvasToBlob(canvas, 'image/png')
+  }
+
+  type PaletteName = 'gb' | 'nes' | 'ega' | 'c64' | 'pico8'
+
+  // Small curated palettes for retro look
+  const PALETTES: Record<PaletteName, Array<[number, number, number]>> = {
+    gb: [
+      [15, 56, 15],
+      [48, 98, 48],
+      [139, 172, 15],
+      [155, 188, 15],
+    ],
+    nes: [
+      // Subset of NES-like colors (16)
+      [124, 124, 124], [0, 0, 252], [0, 0, 188], [68, 40, 188],
+      [148, 0, 132], [168, 0, 32], [168, 16, 0], [136, 20, 0],
+      [80, 48, 0], [0, 120, 0], [0, 104, 0], [0, 88, 0],
+      [0, 64, 88], [0, 0, 0], [188, 188, 188], [248, 248, 248],
+    ],
+    ega: [
+      [0, 0, 0], [0, 0, 170], [0, 170, 0], [0, 170, 170],
+      [170, 0, 0], [170, 0, 170], [170, 85, 0], [170, 170, 170],
+      [85, 85, 85], [85, 85, 255], [85, 255, 85], [85, 255, 255],
+      [255, 85, 85], [255, 85, 255], [255, 255, 85], [255, 255, 255],
+    ],
+    c64: [
+      [0, 0, 0], [255, 255, 255], [136, 0, 0], [170, 255, 238],
+      [204, 68, 204], [0, 204, 85], [0, 0, 170], [238, 238, 119],
+      [221, 136, 85], [102, 68, 0], [255, 119, 119], [51, 51, 51],
+      [119, 119, 119], [170, 255, 102], [0, 136, 255], [187, 187, 187],
+    ],
+    pico8: [
+      [0, 0, 0], [29, 43, 83], [126, 37, 83], [0, 135, 81],
+      [171, 82, 54], [95, 87, 79], [194, 195, 199], [255, 241, 232],
+      [255, 0, 77], [255, 163, 0], [255, 236, 39], [0, 228, 54],
+      [41, 173, 255], [131, 118, 156], [255, 119, 168], [255, 204, 170],
+    ],
+  }
+
+  const BAYER_4X4 = [
+    [0, 8, 2, 10],
+    [12, 4, 14, 6],
+    [3, 11, 1, 9],
+    [15, 7, 13, 5],
+  ]
+
+  function getOpaqueBounds(image: ImageData, alphaThreshold: number): { x: number; y: number; w: number; h: number } | null {
+    const { data, width, height } = image
+    let minX = width, minY = height, maxX = -1, maxY = -1
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4
+        const a = data[idx + 3]
+        if (a > alphaThreshold) {
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) return null
+    return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }
+  }
+
+  function quantizeImageToPalette(src: ImageData, palette: Array<[number, number, number]>, ditherStrength01: number): ImageData {
+    const { data, width, height } = src
+    const out = new ImageData(width, height)
+    const outData = out.data
+    const ditherAmp = Math.max(0, Math.min(1, ditherStrength01)) * 32 // up to ~12% shift
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4
+        const a = data[idx + 3]
+        if (a < 5) {
+          outData[idx] = 0
+          outData[idx + 1] = 0
+          outData[idx + 2] = 0
+          outData[idx + 3] = 0
+          continue
+        }
+        let r = data[idx]
+        let g = data[idx + 1]
+        let b = data[idx + 2]
+
+        if (ditherAmp > 0) {
+          const t = BAYER_4X4[y & 3][x & 3] / 15 // 0..1
+          const offset = (t - 0.5) * 2 * ditherAmp
+          // bias luminance while keeping hue roughly stable
+          const yLum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+          r = clamp255(r + offset * (r / (yLum + 1)))
+          g = clamp255(g + offset * (g / (yLum + 1)))
+          b = clamp255(b + offset * (b / (yLum + 1)))
+        }
+
+        const [qr, qg, qb] = findNearestInPalette(r, g, b, palette)
+        outData[idx] = qr
+        outData[idx + 1] = qg
+        outData[idx + 2] = qb
+        outData[idx + 3] = 255
+      }
+    }
+    return out
+  }
+
+  function clamp255(v: number): number {
+    return v < 0 ? 0 : v > 255 ? 255 : v
+  }
+
+  function findNearestInPalette(r: number, g: number, b: number, palette: Array<[number, number, number]>): [number, number, number] {
+    let bestIdx = 0
+    let bestD = Number.POSITIVE_INFINITY
+    // perceptual weighting toward green, then red, then blue
+    for (let i = 0; i < palette.length; i++) {
+      const [pr, pg, pb] = palette[i]
+      const dr = r - pr
+      const dg = g - pg
+      const db = b - pb
+      const d = 0.3 * dr * dr + 0.59 * dg * dg + 0.11 * db * db
+      if (d < bestD) {
+        bestD = d
+        bestIdx = i
+      }
+    }
+    return palette[bestIdx]
+  }
+
+  function createPixelOutline(src: ImageData, thickness: number): ImageData {
+    const { width, height, data } = src
+    const mask = new Uint8Array(width * height)
+    for (let i = 0; i < width * height; i++) mask[i] = data[i * 4 + 3] > 10 ? 1 : 0
+
+    if (thickness <= 0) {
+      return new ImageData(width, height) // fully transparent
+    }
+
+    let dilated = mask
+    for (let t = 0; t < thickness; t++) {
+      const next = new Uint8Array(width * height)
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = y * width + x
+          if (dilated[i]) {
+            next[i] = 1
+            continue
+          }
+          // 8-neighborhood
+          let any = false
+          for (let dy = -1; dy <= 1 && !any; dy++) {
+            for (let dx = -1; dx <= 1 && !any; dx++) {
+              if (dx === 0 && dy === 0) continue
+              const nx = x + dx
+              const ny = y + dy
+              if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                if (dilated[ny * width + nx]) any = true
+              }
+            }
+          }
+          if (any) next[i] = 1
+        }
+      }
+      dilated = next
+    }
+
+    const out = new ImageData(width, height)
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = y * width + x
+        const inside = mask[i] === 1
+        const grown = dilated[i] === 1
+        const outline = grown && !inside
+        const idx = i * 4
+        if (outline) {
+          out.data[idx] = 0
+          out.data[idx + 1] = 0
+          out.data[idx + 2] = 0
+          out.data[idx + 3] = 255
+        } else {
+          out.data[idx + 3] = 0
+        }
+      }
+    }
+    return out
   }
 
   const onRemoveBgToggle: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
@@ -185,21 +430,7 @@ export default function ImageGenerator() {
           disabled={isBusy}
         />
 
-        <div className="flex flex-col gap-2">
-          <label htmlFor="pixelRange" className="text-sm text-neutral-600 dark:text-neutral-300">
-            Pixel size: {pixelSize}
-          </label>
-          <input
-            id="pixelRange"
-            type="range"
-            min={2}
-            max={50}
-            step={1}
-            value={pixelSize}
-            onChange={onPixelSizeChange}
-            disabled={!selectedFile || isBusy}
-          />
-        </div>
+        {/* Hidden controls removed: Pixel size */}
 
         <div className="flex items-center gap-2">
           <input
@@ -213,6 +444,10 @@ export default function ImageGenerator() {
             Remove Background?
           </label>
         </div>
+
+        {/* Hidden controls removed: Normalize input size toggle and size slider */}
+
+        {/* Hidden controls removed: Palette select, Outline slider, Dither toggle & strength */}
 
         {processingState.phase === 'error' && (
           <p className="text-red-600 dark:text-red-400 text-sm">{processingState.message}</p>
